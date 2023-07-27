@@ -1,0 +1,150 @@
+---
+title: "Analysis of HTSeq counts for sequencing data"
+author: "Jared Bard"
+date: "3/10/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,message = FALSE, warning = FALSE)
+library(tidyverse)
+#BiocManager::install("DESeq2")
+library(DESeq2)
+library(readxl)
+library(conflicted)
+library(GenomicFeatures)
+```
+
+Two sets of pellet data. Using the one that had an extra round of DNase treatment, though they are functionally the same.
+
+```{r}
+src.directory <- c(".")
+count_dir <- paste0(src.directory,"/counts")
+samples <- read_tsv(paste0(src.directory,"/20230309-sample-info.txt")) %>%
+  dplyr::mutate(treatment=factor(temp.b,levels=c("non.HS","HS"))) %>%
+  mutate(sample=paste0("SK",sample))
+count_files <- list.files(paste0(src.directory,"/counts"),
+                          pattern=".*_counts\\.tsv")
+count_names <- str_extract(count_files,pattern=".*(?=_counts)")
+df_files <- tibble(sample=count_names,fileName=count_files)
+
+d_counts <- paste0(count_dir,"/",count_files) %>% map2(count_names,function(file,name) {
+  read_tsv(file,show_col_types = FALSE,comment="#",col_names=c("ORF","counts")) %>%
+  mutate("sample"=name)
+}) %>% bind_rows
+  
+#write_tsv(d_counts,"output/20230309-counts.tsv")
+```
+```{r}
+sample_table <- samples %>%
+  dplyr::left_join(df_files,by="sample") %>%
+  dplyr::filter(!is.na(fileName)) %>%
+  dplyr::mutate(sampleName=sample) %>%
+  dplyr::select(sampleName,fileName,treatment,sample,species,biorep) %>%
+  as.data.frame
+```
+
+# use DESeq to get fold changes
+
+```{r}
+runDESeq2 <- function(sample_table,species) {
+  # function to run deseq on a specific species
+  temp_table <- sample_table %>% dplyr::filter(species==!!species) %>%
+    dplyr::select(sampleName,fileName,treatment,biorep,species)
+  ddsHTSeq <- DESeqDataSetFromHTSeqCount(sampleTable = temp_table,
+                                         directory = count_dir,
+                                         design= ~ treatment)
+  dds <- ddsHTSeq[rowSums(counts(ddsHTSeq)) >= 10,]  %>%
+    DESeq2::DESeq(.) %>%
+    DESeq2::estimateSizeFactors(.)
+  rld <- DESeq2::rlog(dds, blind=TRUE)
+  pca <- plotPCA(rld, intgroup="treatment",returnData=TRUE)
+  pOut <- ggplot(pca,aes(PC1,PC2,color=treatment))+
+    geom_point()+
+    labs(subtitle=species)
+  print(pOut)
+  df_results <- DESeq2::results(dds,tidy=T,alpha=0.05,contrast=c("treatment","HS","non.HS")) %>%
+    dplyr::rename("ORF"="row") %>%
+    dplyr::mutate("treatment"="HS","species"=!!species)
+  return(df_results)
+}
+```
+```{r}
+df_results_Scer <- runDESeq2(sample_table,"Scer")
+df_results_Skud <- runDESeq2(sample_table,"Skud")
+df_results_Kmarx <- runDESeq2(sample_table,"Kmarx")
+df_results <- bind_rows(df_results_Skud,df_results_Scer,df_results_Kmarx)
+#write_tsv(df_results,"output/20230309-deseq.tsv")
+```
+
+# Calculate TPMs by pulling gene lengths from the gtf files
+```{r}
+extractLengths <- function(species,gtf) {
+  library(GenomicFeatures)
+  # makes a tibble of gene lengths from the GTF
+  txdb <- makeTxDbFromGFF(gtf,format="gtf")
+  # then collect the exons per gene id
+  CDS.list.per.gene <- cdsBy(txdb,by="gene")
+  # then for each gene, reduce all the exons to a set of non overlapping exons, calculate their lengths (widths) and sum then
+  CDS.gene.sizes <- sum(width(GenomicRanges::reduce(CDS.list.per.gene)))
+  gene_lengths <- tibble("ORF"=names(CDS.gene.sizes),"merged.exon.length"=CDS.gene.sizes,
+                         "species"=!!species)
+  return(gene_lengths)
+}
+lengths_Scer <- extractLengths("Scer","GCF_000146045.2_R64_genomic.gtf")
+write_tsv(lengths_Scer %>% dplyr::select(ORF,merged.exon.length),
+          "output/Scer_merged_exon_lengths.tsv")
+lengths_Skud <- extractLengths("Skud","GCA_947243785.1_Skud-ZP591_genomic.cleaned.gtf")
+write_tsv(lengths_Skud %>% dplyr::select(ORF,merged.exon.length),
+          "output/Skud_merged_exon_lengths.tsv")
+lengths_Kmarx <- extractLengths("Kmarx","GCA_001417885.1_Kmar_1.0_genomic.cleaned.gtf")
+write_tsv(lengths_Kmarx %>% dplyr::select(ORF,merged.exon.length),
+          "output/Kmarx_merged_exon_lengths.tsv")
+lengths_all <- bind_rows(lengths_Scer,lengths_Skud,lengths_Kmarx)
+```
+```{r}
+df_tpm <- d_counts %>%
+  left_join(samples,by="sample") %>%
+  left_join(lengths_all,by=c("ORF","species")) %>%
+  dplyr::filter(!is.na(merged.exon.length)) %>%
+  group_by(sample,ORF,merged.exon.length) %>%
+  summarise(total_counts = sum(counts)) %>%
+  mutate(RPKB = total_counts/(merged.exon.length/1e3)) %>%
+  group_by(sample) %>%
+  mutate(total_sample_counts = sum(RPKB)) %>%
+  mutate(TPM = RPKB/total_sample_counts*1e6)
+write_tsv(df_tpm %>% dplyr::select(sample,ORF,TPM),"output/20230309_TPM.tsv")
+```
+```{r}
+label.levels <- c("spike","other","translation","glycolysis","MSN2/4","HSF1")
+label.cols <- c("translation"="#56B4E9",
+                "glycolysis"="#CC79A7",
+                "MSN2/4" = "#E69F00",
+                "HSF1"="#D55E00",
+                "other"="grey50",
+                "spike"="black")
+gene_labels <- read_tsv("src/label_Scer_genes/230215_labeled_genes_scer.tsv") %>%
+  mutate(label=factor(label,label.levels))
+
+df <- df_tpm %>%
+  dplyr::select(ORF,sample,TPM) %>%
+  left_join(samples,by="sample") %>%
+  dplyr::filter(species=="Scer") %>%
+  left_join(gene_labels,by="ORF") %>%
+  dplyr::filter(classification=="Verified") %>%
+  group_by(ORF,gene,treatment,label) %>%
+  summarise(TPM.mean = exp(mean(log(TPM)))) %>%
+  pivot_wider(names_from=treatment,values_from=TPM.mean) %>%
+  mutate(log10FC_TPM = log10(HS/non.HS)) %>%
+  left_join(df_results %>% dplyr::select(ORF,log2FoldChange,padj),by="ORF") %>%
+  mutate(logFC_deseq = log10(2^log2FoldChange)) %>%
+  arrange(label)
+p_Scer <- ggplot(df,
+       aes(non.HS,HS,color=label))+
+  geom_point(alpha=0.5)+
+  scale_x_log10()+scale_y_log10()+
+  scale_color_manual(values=label.cols)
+p_Scer
+```
+
+

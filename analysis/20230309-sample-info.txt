@@ -1,0 +1,13 @@
+sample	temp	species	temp.b	biorep
+1	24	Skud	non.HS	1
+2	24	Skud	non.HS	2
+3	31	Skud	HS	1
+4	31	Skud	HS	2
+5	33	Scer	non.HS	1
+6	33	Scer	non.HS	2
+7	40	Scer	HS	1
+8	40	Scer	HS	2
+9	37	Kmarx	non.HS	1
+10	37	Kmarx	non.HS	2
+11	46	Kmarx	HS	1
+12	46	Kmarx	HS	2
